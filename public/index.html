@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>BrowserAuto — Capture Builder</title><link rel="stylesheet" href="/style.css"></head>
+<body>
+  <aside class="sidebar">
+    <a class="brand" href="/">▣ BrowserAuto</a>
+    <div class="nav-label">WORKSPACE</div>
+    <nav id="nav"><button data-view="builder" class="active">Capture builder</button><button data-view="profiles">Profiles <b id="profile-count">0</b></button><button data-view="runs">Run history <b id="run-count">0</b></button></nav>
+    <div class="workflow-heading"><span class="nav-label">WORKFLOWS</span><button id="new-sidebar" class="icon-button" title="Create workflow">+</button></div>
+    <div id="workflow-list" class="workflow-list"></div>
+    <div class="sidebar-bottom"><button id="guide-button" class="guide-button">Quick start / Help</button></div>
+  </aside>
+  <main>
+    <header><div class="breadcrumb"><strong id="page-label">Capture builder</strong></div><div class="header-right">Local automation engine <span class="local-status">Connected</span></div></header>
+    <section id="builder-view" class="view">
+      <div class="studio-toolbar"><div class="workflow-title"><label for="workflow-name">Workflow</label><input id="workflow-name" aria-label="Workflow name" maxlength="100"><small id="save-status">Saved</small></div><div class="toolbar-actions"><button class="button secondary" id="import-button">Import…</button><button id="export-button" class="button secondary">Export…</button><button id="save-button" class="button secondary">Save</button><button id="run-button" class="button primary">▶ Run</button></div></div>
+      <div class="start-card"><label for="start-url">Start URL</label><input id="start-url" type="url" aria-label="Starting URL" placeholder="https://example.com"><a id="open-page" target="_blank" rel="noreferrer" title="Open starting page">Open ↗</a></div>
+      <div class="recorder-card"><div class="recorder-top"><strong>Browser capture</strong><span class="pill" id="recorder-status">Ready</span></div><div class="capture-toolbar"><label for="browser-select">Browser</label><select id="browser-select" aria-label="Recording browser"><option value="chromium">Detecting browsers…</option></select><button id="refresh-browsers" class="button secondary" title="Detect installed browsers">Refresh</button><button class="button secondary" id="record-button">● Start capture</button><div id="recording-controls" hidden><button id="record-pause" class="button secondary">Pause</button><button id="record-save" class="button primary">■ Stop & save</button><button id="record-discard" class="button secondary">Discard</button></div></div><div id="recording-info" class="capture-info">Open a browser, click and type normally. Each action captures its selector and element HTML.</div></div>
+      <div id="cursor-status" class="cursor-status">Cursor tracking enabled · move the mouse in the recording page</div>
+      <div class="studio-grid">
+        <div class="canvas-panel">
+          <div class="canvas-tabs"><button class="selected" id="visual-tab">Actions</button><button id="json-tab">JSON</button><span id="step-count"></span><button id="workflow-options" title="Workflow options" aria-label="Workflow options">•••</button></div>
+          <div id="visual-panel"><div class="step-table-header"><span>#</span><span>Action</span><span>Element / description</span><span>Type</span></div><div id="steps" class="steps"></div><button id="add-step" class="add-step">+ Add action</button></div>
+          <div id="json-panel" hidden><textarea id="json-editor" spellcheck="false" aria-label="Workflow JSON"></textarea><button id="apply-json" class="button primary">Apply JSON</button></div>
+          <div class="canvas-footer"><span id="capture-mode">Editor</span><span id="canvas-footer-count">0 steps</span></div>
+        </div>
+        <aside class="inspector"><div class="step-inspector" id="step-inspector"></div></aside>
+      </div>
+    </section>
+    <section id="profiles-view" class="view" hidden><div class="page-heading"><div><h1>Profiles</h1><p>Variables and saved browser sessions.</p></div><button id="new-profile" class="button primary">New profile</button></div><div id="profiles-grid" class="profiles-grid"></div></section>
+    <section id="runs-view" class="view" hidden><div class="page-heading"><div><h1>Run history</h1><p>Execution status, logs, and screenshots.</p></div><button id="runs-new" class="button primary">▶ New run</button></div><div id="run-stats" class="run-stats"></div><div class="runs-layout"><div id="runs-list"></div><div id="run-detail"></div></div></section>
+    <footer><span>BrowserAuto · Capture Builder</span><span>Local backend · No cloud connection</span></footer>
+  </main>
+  <dialog id="dialog"><form id="dialog-form"><div class="dialog-heading"><h2 id="dialog-title"></h2><button type="button" id="dialog-close" class="icon-button" aria-label="Close dialog">×</button></div><div id="dialog-body"></div><div class="dialog-footer"><button type="button" id="dialog-cancel" class="button secondary">Cancel</button><button type="submit" id="dialog-submit" class="button primary">Save</button></div></form></dialog>
+  <div id="toast" role="status" aria-live="polite" hidden></div><input type="file" id="import-file" accept=".json,application/json" hidden>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

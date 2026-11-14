@@ -1,0 +1,205 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtemp, rm, mkdir, readFile } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { chromium } from 'playwright';
+import { createApp } from '../server.js';
+import { interpolate, workflowSchema } from '../lib/schema.js';
+import { replayMousePath, scalePoint, clickRecordedElement } from '../lib/mouse.js';
+
+test('workflow validation and variables reject invalid inputs', () => {
+  assert.equal(interpolate('Hi {{ name }}', { name: 'Alex' }), 'Hi Alex');
+  assert.throws(() => interpolate('{{password}}', {}), /Missing profile variable/);
+  assert.throws(() => workflowSchema.parse({ name: 'Invalid', startUrl: 'file:///etc/passwd' }));
+  assert.throws(() => workflowSchema.parse({ name: 'Invalid', startUrl: 'https://example.com', steps: [{ id: 'a', type: 'wait', value: 'NaN' }] }));
+});
+
+test('real browser integration: playback, recording, controls, persistence, and UI', { timeout: 120000 }, async t => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), 'browserauto-test-'));
+  const baseUrl = 'http://127.0.0.1:4311';
+  const { app, store, automation } = await createApp({ dataDir, baseUrl, headlessRecorder: true });
+  const server = await new Promise(resolve => { const listener = app.listen(4311, '127.0.0.1', () => resolve(listener)); });
+  let browser;
+  t.after(async () => { await browser?.close(); await automation.shutdown(); while (automation.active.size) await new Promise(r => setTimeout(r, 30)); await store.queue; await new Promise(r => server.close(r)); await rm(dataDir, { recursive: true, force: true }); });
+  const getState = async () => (await fetch(`${baseUrl}/api/state`)).json();
+  let state = await getState(); const token = state.token;
+  const post = async (url, body) => { const res = await fetch(`${baseUrl}/api${url}`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-BrowserAuto-Token': token }, body: JSON.stringify(body) }); const result = await res.json(); assert.equal(res.status, 200, JSON.stringify(result)); return result; };
+  const waitUntil = async (fn, timeout = 20000) => { const end = Date.now() + timeout; while (Date.now() < end) { const result = await fn(); if (result) return result; await new Promise(r => setTimeout(r, 100)); } throw new Error('Timed out waiting for condition'); };
+  const finished = async id => waitUntil(async () => { const r = (await getState()).runs.find(r => r.id === id); return r && !['running', 'queued', 'paused'].includes(r.status) ? r : null; });
+  const workflow = state.workflows[0]; const profile = state.profiles[0];
+  const actions = () => automation.recorder.steps.filter(s => s.type !== 'move');
+
+  await t.test('local API rejects missing token and foreign origins', async () => {
+    assert.equal((await fetch(`${baseUrl}/api/workflows`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })).status, 403);
+    assert.equal((await fetch(`${baseUrl}/api/state`, { headers: { Origin: 'https://example.com' } })).status, 403);
+  });
+  await t.test('two profiles execute concurrently and save screenshots and sessions', async () => {
+    const second = await post('/profiles', { name: 'Second profile', variables: { name: 'Jamie Chen', email: 'jamie@example.test', team: 'Design' } });
+    const runs = await post('/runs', { workflowId: workflow.id, profileIds: [profile.id, second.id], concurrency: 2, headless: true });
+    const results = await Promise.all(runs.map(r => finished(r.id)));
+    for (const result of results) { assert.equal(result.status, 'passed', result.error); assert.equal(result.currentStep, 7); assert.equal(result.screenshots.length, 1); assert.equal((await fetch(`${baseUrl}${result.screenshots[0].url}`)).status, 200); }
+    state = await getState(); assert.ok(state.profiles.every(p => p.hasSession));
+  });
+  await t.test('recorder captures actions, merges typing, calibrates, and replays', async () => {
+    const recorded = await post('/workflows', { name: 'Recorded form', startUrl: `${baseUrl}/practice`, steps: [] });
+    await post('/record/start', { workflowId: recorded.id, profileId: profile.id });
+    const page = automation.recorder.page;
+    await page.locator('#full-name').pressSequentially('Taylor');
+    await page.locator('#email').fill('taylor@example.test');
+    await page.locator('#team').selectOption('Operations');
+    await page.locator('#consent').check();
+    await page.locator('#submit').click();
+    assert.equal((await post('/calibrate', { selector: '#full-name' })).count, 1);
+    await waitUntil(() => actions().length === 5);
+    assert.equal(actions()[0].value, 'Taylor');
+    assert.match(actions()[0].capture.html, /id="full-name"/);
+    assert.equal(actions().at(-1).capture.tag, 'button');
+    assert.equal(actions().at(-1).capture.pageUrl, `${baseUrl}/practice`);
+    assert.equal(actions().at(-1).type, 'click');
+    assert.ok(actions().at(-1).clickPosition.x > 0);
+    await post('/record/stop', { save: true });
+    assert.match((await getState()).workflows.find(w => w.id === recorded.id).steps.find(s => s.type === 'fill').capture.html, /<input/);
+    const runs = await post('/runs', { workflowId: recorded.id, profileIds: [profile.id], concurrency: 1, headless: true });
+    assert.equal((await finished(runs[0].id)).status, 'passed');
+  });
+  await t.test('password input is recorded as a variable', async () => {
+    await post('/record/start', { workflowId: workflow.id, profileId: profile.id });
+    await automation.recorder.page.evaluate(() => { const input = document.createElement('input'); input.type = 'password'; input.id = 'password'; input.setAttribute('value', 'do-not-store-this'); document.body.append(input); });
+    await automation.recorder.page.locator('#password').fill('do-not-store-this');
+    await waitUntil(() => actions().length === 1);
+    assert.equal(actions()[0].value, '{{password}}');
+    assert.ok(!JSON.stringify(automation.recorderState()).includes('do-not-store-this'));
+    await post('/record/stop', { save: false });
+  });
+  await t.test('installed browser capture supports HTML, pause/resume, and save', async () => {
+    const available = await (await fetch(`${baseUrl}/api/browsers`)).json();
+    const installed = available.find(b => b.id !== 'chromium' && b.available);
+    if (!installed) { t.diagnostic('No branded browser installed; using bundled Chromium.'); }
+    await post('/record/start', { workflowId: workflow.id, profileId: profile.id, browserId: installed?.id || 'chromium' });
+    const page = automation.recorder.page;
+    await post('/record/pause', { paused: true });
+    await page.locator('#full-name').fill('Not captured');
+    assert.equal(automation.recorder.steps.length, 0);
+    await post('/record/pause', { paused: false });
+    await page.locator('#full-name').fill('Captured');
+    await waitUntil(() => actions().length === 1);
+    assert.match(actions()[0].capture.html, /input/);
+    assert.equal(automation.recorderState().browserId, installed?.id || 'chromium');
+    await post('/record/stop', { save: false });
+  });
+  await t.test('failed actions provide an error and failure screenshot', async () => {
+    const invalid = await post('/workflows', { name: 'Intentional failure', startUrl: `${baseUrl}/practice`, steps: [{ id: randomUUID(), type: 'click', selector: '#does-not-exist', timeout: 500 }] });
+    const runs = await post('/runs', { workflowId: invalid.id, profileIds: [profile.id], headless: true });
+    const result = await finished(runs[0].id); assert.equal(result.status, 'failed'); assert.match(result.error, /Timeout/); assert.equal(result.screenshots.length, 1);
+  });
+  await t.test('mouse trail tracks resize and physical button clicks target the element', async () => {
+    const recorded = await post('/workflows', { name: 'Cursor resize test', startUrl: `${baseUrl}/practice`, steps: [] });
+    await post('/record/start', { workflowId: recorded.id, profileId: profile.id });
+    const page = automation.recorder.page;
+    await page.setViewportSize({ width: 1000, height: 800 });
+    await page.mouse.move(500, 400);
+    await waitUntil(() => automation.recorder.steps.some(s => s.type === 'move'));
+    const point = automation.recorder.steps.find(s => s.type === 'move').mousePath[0];
+    assert.equal(point.x, 0.5); assert.equal(point.y, 0.5);
+    await page.setViewportSize({ width: 500, height: 600 });
+    await new Promise(resolve => setTimeout(resolve, 60));
+    await page.mouse.move(250, 300);
+    await waitUntil(() => automation.recorder.steps.at(-1).mousePath?.at(-1).width === 500);
+    await page.evaluate(() => { const button = document.createElement('button'); button.id = 'resize-target'; button.textContent = 'Resize target'; button.style.cssText = 'position:fixed;right:20px;top:20px;width:120px;height:50px'; button.onclick = event => { window.clickResult = { id: event.target.id, x: event.offsetX, y: event.offsetY }; }; document.body.append(button); });
+    const box = await page.locator('#resize-target').boundingBox();
+    await page.mouse.click(box.x + box.width * 0.25, box.y + box.height * 0.75);
+    await waitUntil(() => actions().some(s => s.selector === '#resize-target'));
+    const click = actions().find(s => s.selector === '#resize-target');
+    assert.equal(click.type, 'click'); assert.ok(Math.abs(click.clickPosition.x - 0.25) < 0.02);
+    assert.match(click.capture.html, /Resize target/);
+    await post('/record/pause', { paused: true });
+    const count = automation.recorder.steps.length;
+    await page.mouse.move(10, 10); assert.equal(automation.recorder.steps.length, count);
+    // Replay normalized coordinates against a smaller real viewport.
+    await page.setViewportSize({ width: 400, height: 300 });
+    await page.evaluate(() => document.addEventListener('mousemove', event => window.mouseResult = { x: event.clientX, y: event.clientY }));
+    await replayMousePath(page, [{ ...point, dt: 0 }]);
+    assert.deepEqual(await page.evaluate(() => window.mouseResult), { x: 200, y: 150 });
+    assert.deepEqual(scalePoint(point, { width: 400, height: 300 }), { x: 200, y: 150 });
+    await page.evaluate(() => { window.clickResult = null; document.querySelector('#resize-target').style.width = '160px'; });
+    await clickRecordedElement(page.locator(click.selector), click.clickPosition);
+    const result = await page.evaluate(() => window.clickResult);
+    assert.equal(result.id, 'resize-target');
+    assert.ok(Math.abs(result.x - 40) < 4, 'Replay must preserve the position within the resized button');
+    await post('/record/stop', { save: true });
+    const saved = (await getState()).workflows.find(w => w.id === recorded.id);
+    assert.ok(saved.steps.some(s => s.type === 'move' && s.mousePath.length));
+    assert.ok(saved.steps.some(s => s.type === 'click' && s.clickPosition));
+  });
+  await t.test('runs sharing a profile queue instead of racing session writes', async () => {
+    const short = await post('/workflows', { name: 'Serialized session', startUrl: `${baseUrl}/practice`, steps: [{ id: randomUUID(), type: 'wait', value: '500' }] });
+    const [first] = await post('/runs', { workflowId: short.id, profileIds: [profile.id], concurrency: 3, headless: true });
+    const [second] = await post('/runs', { workflowId: short.id, profileIds: [profile.id], concurrency: 3, headless: true });
+    assert.equal(second.status, 'queued');
+    const a = await finished(first.id); const b = await finished(second.id);
+    assert.equal(a.status, 'passed'); assert.equal(b.status, 'passed'); assert.ok(new Date(b.startedAt) >= new Date(a.finishedAt));
+  });
+  await t.test('pause, resume, and cancel terminate a long-running workflow', async () => {
+    const waiting = await post('/workflows', { name: 'Cancelable run', startUrl: `${baseUrl}/practice`, steps: [{ id: randomUUID(), type: 'wait', value: '15000' }] });
+    const [run] = await post('/runs', { workflowId: waiting.id, profileIds: [profile.id], headless: true });
+    await waitUntil(() => store.state.runs.find(r => r.id === run.id).currentStep === 1);
+    assert.equal((await post(`/runs/${run.id}/control`, { action: 'pause' })).status, 'paused');
+    assert.equal((await post(`/runs/${run.id}/control`, { action: 'resume' })).status, 'running');
+    await post(`/runs/${run.id}/control`, { action: 'cancel' });
+    assert.equal((await finished(run.id)).status, 'canceled');
+  });
+  await t.test('UI renders, edits, creates profiles, launches a run, and adapts to mobile', async () => {
+    browser = await chromium.launch({ headless: true }); const page = await browser.newPage({ viewport: { width: 1440, height: 1100 } });
+    const errors = []; page.on('pageerror', e => errors.push(e.message));
+    await page.goto(baseUrl); await page.locator('.step').first().waitFor();
+    assert.equal(await page.locator('.step').count(), 7);
+    await page.locator('[data-field="label"]').fill('Fill the profile name'); await page.locator('#save-button').click();
+    await waitUntil(async () => (await getState()).workflows[0].steps[0].label === 'Fill the profile name');
+    await page.locator('#json-tab').click();
+    const definition = JSON.parse(await page.locator('#json-editor').inputValue()); definition.description = 'Updated through JSON';
+    await page.locator('#json-editor').fill(JSON.stringify(definition)); await page.locator('#apply-json').click();
+    await waitUntil(async () => (await getState()).workflows[0].description === 'Updated through JSON');
+    await page.locator('#visual-panel:not([hidden])').waitFor();
+    await mkdir('test-results', { recursive: true }); await page.screenshot({ path: 'test-results/studio-desktop.png', fullPage: true });
+    await page.locator('[data-view="profiles"]').click(); await page.locator('#new-profile').click();
+    await page.locator('[name="name"]').fill('UI profile'); await page.locator('[name="variables"]').fill('{"name":"Sam","email":"sam@example.test","team":"Design"}'); await page.locator('#dialog-submit').click();
+    await page.getByRole('heading', { name: 'UI profile', exact: true }).waitFor();
+    await page.locator('[data-view="builder"]').click(); await page.locator('#run-button').click(); await page.locator('#dialog-submit').click();
+    await page.locator('#runs-view:not([hidden])').waitFor();
+    await waitUntil(async () => (await getState()).runs[0].status === 'passed');
+    await page.locator('[data-view="builder"]').click();
+    await page.getByRole('button', { name: 'Recorded form', exact: true }).click();
+    await page.locator('#start-url').fill('https://');
+    await new Promise(resolve => setTimeout(resolve, 1200));
+    assert.equal(automation.recorder, null, 'Incomplete URLs must not launch a browser');
+    await page.locator('#start-url').fill(`${baseUrl}/practice?capture=draft`);
+    await page.locator('#start-url').fill(`${baseUrl}/practice?capture=final`);
+    await waitUntil(() => automation.recorder?.status === 'recording');
+    assert.equal(automation.recorder.page.url(), `${baseUrl}/practice?capture=final`);
+    assert.equal(await page.locator('#dialog').isVisible(), false, 'URL capture must not require a confirmation dialog');
+    await automation.recorder.page.locator('#full-name').fill('Live HTML capture');
+    await page.locator('#capture-html').waitFor();
+    assert.match(await page.locator('#capture-html').textContent(), /id="full-name"/);
+    assert.equal(await page.locator('[data-field="label"]').isDisabled(), true);
+    await page.screenshot({ path: 'test-results/capture-html.png' });
+    await page.locator('#record-pause').click();
+    await waitUntil(() => automation.recorder?.status === 'paused');
+    await automation.recorder.page.locator('#email').fill('ignored@example.test');
+    assert.equal(actions().length, 1);
+    await page.locator('#record-save').click();
+    await waitUntil(() => !automation.recorder);
+    await page.locator('[data-field="label"]:enabled').waitFor();
+    assert.match(await page.locator('#capture-html').textContent(), /<input/);
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.screenshot({ path: 'test-results/studio-mobile.png', fullPage: true });
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false, 'Mobile layout overflows');
+    assert.deepEqual(errors, []);
+  });
+  await t.test('workflows and profiles are persisted to disk', async () => {
+    await store.queue;
+    const saved = JSON.parse(await readFile(path.join(dataDir, 'store.json'), 'utf8'));
+    assert.ok(saved.profiles.some(p => p.name === 'UI profile')); assert.equal(saved.workflows[0].steps[0].label, 'Fill the profile name');
+  });
+});
