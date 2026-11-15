@@ -1,9 +1,11 @@
+import { installGeneratorUI, renderGeneratedValues } from './generator-ui.js';
+const revealedRuns = new Set();
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 const esc = value => String(value ?? '').replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
 const icons = { navigate: '↗', click: '↖', fill: 'T', select: '≡', check: '✓', press: '↵', wait: '◷', assert: '✓', screenshot: '▧', move: '⌖' };
 const labels = { navigate: 'Navigate', click: 'Click', fill: 'Fill text', select: 'Select option', check: 'Check / uncheck', press: 'Press key', wait: 'Wait', assert: 'Assert text', screenshot: 'Screenshot', move: 'Mouse movement' };
-let state = { workflows: [], profiles: [], runs: [] }, current, selectedStep, view = 'builder', dirty = false, jsonDirty = false, selectedRun, toastTimer, dialogHandler;
+let state = { workflows: [], runs: [] }, current, selectedStep, view = 'builder', dirty = false, jsonDirty = false, selectedRun, toastTimer, dialogHandler;
 let browsers = [], captureSignature = '';
 let urlCaptureTimer, startingUrlCapture = false, urlDraft;
 function cancelUrlCapture() { clearTimeout(urlCaptureTimer); urlCaptureTimer = undefined; }
@@ -26,8 +28,7 @@ async function startCaptureFromUrl(workflowId, typedValue) {
     if (!current) current = await api('/workflows', { name: 'New recording', startUrl: url, steps: [] });
     current.startUrl = url; dirty = true;
     await saveWorkflow();
-    const profile = state.profiles[0] || await api('/profiles', { name: 'Capture profile', variables: {} });
-    await api('/record/start', { workflowId: current.id, profileId: profile.id, browserId: $('#browser-select').value });
+    await api('/record/start', { workflowId: current.id, browserId: $('#browser-select').value });
     if (urlDraft === typedValue) urlDraft = undefined;
     $('#visual-tab').click(); await refresh(); toast('Recording started — use the opened browser');
   } catch (error) { toast(`Could not start recording: ${error.message}`, true); }
@@ -59,12 +60,12 @@ function switchView(next) {
   view = next;
   $$('.view').forEach(el => el.hidden = el.id !== `${view}-view`);
   $$('#nav button').forEach(el => el.classList.toggle('active', el.dataset.view === view));
-  $('#page-label').textContent = { builder: 'Capture builder', profiles: 'Profiles', runs: 'Run history' }[view];
-  if (view === 'profiles') renderProfiles(); if (view === 'runs') renderRuns();
+  $('#page-label').textContent = { builder: 'Capture builder', runs: 'Run history' }[view];
+  if (view === 'runs') renderRuns();
 }
 function renderSidebar() {
   $('#workflow-list').innerHTML = state.workflows.map(w => `<button class="workflow-item ${current?.id === w.id ? 'selected' : ''}" data-workflow="${w.id}"><i></i><span>${esc(w.name)}</span></button>`).join('') || '<div class="empty-state">Create your first workflow.</div>';
-  $('#profile-count').textContent = state.profiles.length; $('#run-count').textContent = state.runs.length;
+  $('#run-count').textContent = state.runs.length;
 }
 function chooseWorkflow(id) {
   if (startingUrlCapture) return;
@@ -76,6 +77,8 @@ function chooseWorkflow(id) {
   switchView('builder'); renderBuilder(); renderSidebar();
 }
 function renderBuilder() {
+  $('#generator-summary').textContent = current?.generator ? `${current.generator.fields.length} variables · ${current.generator.enabled ? 'Answers generated automatically on every run' : 'Generator disabled'}` : 'Recorded form answers are generated automatically when you run. Review the rules here.';
+  $('#generator-button').disabled = !current || !!activeCapture();
   if (urlDraft !== undefined && urlDraft !== current?.startUrl) dirty = true;
   $('#workflow-name').value = current?.name || ''; $('#start-url').value = urlDraft ?? current?.startUrl ?? '';
   $('#open-page').href = current?.startUrl || '#';
@@ -115,12 +118,13 @@ function renderRecorder() {
   $('#record-button').disabled = !current || startingUrlCapture;
   $('#record-pause').textContent = r?.status === 'paused' ? 'Resume' : 'Pause';
   $('#record-pause').disabled = !['recording', 'paused'].includes(r?.status);
-  $('#recording-info').textContent = r ? `${r.browserId} · ${r.tabCount || 0} tabs · ${r.steps.length} actions captured${r.error ? ` · ${r.error}` : ` · ${r.url || 'Opening browser…'}`}` : startingUrlCapture ? 'Opening browser and starting recording…' : 'Enter a Start URL to begin recording automatically after 1 second. Press Enter to start immediately. Uses the first profile.';
+  $('#recording-info').textContent = r ? `${r.browserId} · ${r.tabCount || 0} tabs · ${r.steps.length} actions captured${r.error ? ` · ${r.error}` : ` · ${r.url || 'Opening browser…'}`}` : startingUrlCapture ? 'Opening browser and starting recording…' : 'Enter a Start URL to begin recording automatically after 1 second. Press Enter to start immediately.';
   $('#capture-mode').textContent = activeCapture() ? 'Live capture — stop to edit' : 'Editor';
   for (const id of ['save-button', 'add-step', 'apply-json', 'workflow-name']) $(`#${id}`).disabled = !current || !!activeCapture() || startingUrlCapture;
   $('#start-url').disabled = false;
   if (urlDraft !== undefined && (r || startingUrlCapture)) $('#recording-info').textContent += ' · New URL kept as a draft; stop the current capture, then press Enter to use it.';
   $('#run-button').disabled = !current || !!activeCapture();
+  $('#generator-button').disabled = !current || !!activeCapture();
   $('#json-tab').disabled = !!activeCapture();
   const signature = activeCapture() ? JSON.stringify([r.status, r.steps.length, r.steps.at(-1)]) : '';
   if (signature !== captureSignature) {
@@ -146,34 +150,47 @@ function newWorkflow() {
     const w = await api('/workflows', { name: form.get('name'), startUrl: form.get('startUrl'), steps: [] }); await refresh(); chooseWorkflow(w.id);
   });
 }
-function editProfile(id) {
-  const p = state.profiles.find(p => p.id === id);
-  openDialog(p ? 'Edit profile' : 'Create a profile', `${field('Profile name', 'name', p?.name, 'required maxlength="100"')}<label class="form-field">Variables (JSON)<textarea name="variables" rows="8" spellcheck="false" required>${esc(JSON.stringify(p?.variables || { name: '', email: '' }, null, 2))}</textarea><small>String values only. Use {{variable_name}} in your workflow. Variables and saved sessions are stored on this computer.</small></label>`, p ? 'Save profile' : 'Create profile', async form => {
-    await api('/profiles', { ...(p ? { id: p.id } : {}), name: form.get('name'), variables: JSON.parse(form.get('variables')) }); await refresh(); renderProfiles(); toast('Profile saved');
-  });
-}
-function renderProfiles() {
-  $('#profiles-grid').innerHTML = state.profiles.map(p => `<article class="profile-card"><div class="profile-card-top"><span class="avatar">${esc(p.name.slice(0, 2).toUpperCase())}</span><div><h3>${esc(p.name)}</h3><small>${p.hasSession ? '● Saved browser session' : '○ Fresh browser session'}</small></div></div><div class="variable-list">${Object.entries(p.variables).map(([key, value]) => `<div class="variable-row"><code>${esc(key)}</code><span>${/password|secret|token/i.test(key) ? '••••••••' : esc(value)}</span></div>`).join('') || '<p class="muted">No variables yet</p>'}</div><div class="profile-actions"><button class="button secondary" data-edit-profile="${p.id}">Edit profile</button><button class="button ghost danger" data-delete-profile="${p.id}">Delete</button></div></article>`).join('') || '<div class="empty-state"><strong>Make your workflow personal</strong>Add a profile with variables to start running.</div>';
-}
 async function runDialog() {
   if (!current) throw new Error('Create or select a workflow first.');
   if (dirty) await saveWorkflow();
-  if (!state.profiles.length) { editProfile(); return; }
-  openDialog('Run workflow', `<p class="muted">Run <strong>${esc(current.name)}</strong> in a separate browser session for each selected profile.</p><div class="form-field">Profiles</div>${state.profiles.map((p, i) => `<label class="check-row"><input type="checkbox" name="profiles" value="${p.id}" ${i === 0 ? 'checked' : ''}>${esc(p.name)}<small>${p.hasSession ? 'Saved session' : 'Fresh session'}</small></label>`).join('')}${field('Concurrent browsers (1–8)', 'concurrency', '3', 'type="number" min="1" max="8" required')}<label class="check-row"><input name="headless" type="checkbox" checked>Run browsers in the background</label><p class="muted">Pause takes effect between steps. Cancel closes the browser immediately.</p>`, '▶ Start run', async form => {
-    const runs = await api('/runs', { workflowId: current.id, profileIds: form.getAll('profiles'), concurrency: Number(form.get('concurrency')), headless: form.has('headless'), browserId: $('#browser-select').value, replayMouse: form.has('replayMouse'), showCursor: form.has('showCursor'), viewportWidth: Number(form.get('viewportWidth')), viewportHeight: Number(form.get('viewportHeight')) });
+  openDialog('Run workflow', `<p class="muted">Each run uses a fresh browser session and its own generated answers.</p>${field('Number of runs (1–10)', 'runCount', '1', 'type="number" min="1" max="10" required')}${field('Concurrent browsers (1–8)', 'concurrency', '3', 'type="number" min="1" max="8" required')}<label class="check-row"><input name="headless" type="checkbox">Run browsers in the background</label><label class="check-row"><input name="keepBrowserOpen" type="checkbox" checked>Keep visible browsers open after the run</label><p class="muted">Pause takes effect between steps. Cancel closes the browser immediately.</p>`, '▶ Start run', async form => {
+    const runs = await api('/runs', { name: form.get('runName'), workflowId: current.id, runCount: Number(form.get('runCount')), keepBrowserOpen: form.has('keepBrowserOpen'), concurrency: Number(form.get('concurrency')), headless: form.has('headless'), browserId: $('#browser-select').value, replayMouse: form.has('replayMouse'), showCursor: form.has('showCursor'), viewportWidth: Number(form.get('viewportWidth')), viewportHeight: Number(form.get('viewportHeight')) });
     selectedRun = runs[0].id; await refresh(); switchView('runs'); toast(`${runs.length} run${runs.length === 1 ? '' : 's'} queued`);
   });
+  $('#dialog-body').insertAdjacentHTML('afterbegin', field('Run name', 'runName', current.name, 'maxlength="100" placeholder="Leave blank to use the workflow name"'));
   $('#dialog-body').insertAdjacentHTML('beforeend', `<label class="check-row"><input name="replayMouse" type="checkbox" checked>Replay recorded mouse movement</label><label class="check-row"><input name="showCursor" type="checkbox" checked>Show red cursor marker during playback</label><div class="viewport-fields">${field('Background viewport width', 'viewportWidth', '1360', 'type="number" min="320" max="3840" required')}${field('Height', 'viewportHeight', '900', 'type="number" min="240" max="2160" required')}</div><p class="muted">Visible browsers follow their window size. Clicks follow the HTML element even if the layout changes. A hidden or replaced button may require a different selector.</p>`);
 }
 function renderRuns() {
   const counts = [state.runs.length, state.runs.filter(r => ['running', 'queued', 'paused'].includes(r.status)).length, state.runs.filter(r => r.status === 'passed').length, state.runs.filter(r => ['failed', 'interrupted'].includes(r.status)).length];
   $('#run-stats').innerHTML = ['Total runs', 'In progress', 'Successful', 'Needs attention'].map((label, i) => `<div class="stat"><small>${label}</small><strong>${counts[i]}</strong></div>`).join('');
   if (!selectedRun) selectedRun = state.runs[0]?.id;
-  $('#runs-list').innerHTML = state.runs.map(r => `<button class="run-row ${selectedRun === r.id ? 'selected' : ''}" data-run="${r.id}"><div><strong>${esc(r.workflowName)}</strong><span class="status ${r.status}">${r.status}</span></div><small>${esc(r.profileName)} · ${new Date(r.createdAt).toLocaleString()}</small></button>`).join('') || '<div class="empty-state"><strong>No runs yet</strong>Your workflow’s next chapter starts with Run.</div>';
+  $('#runs-list').innerHTML = state.runs.map(r => `<button class="run-row ${selectedRun === r.id ? 'selected' : ''}" data-run="${r.id}"><div><strong>${esc(r.name || r.workflowName)}</strong><span class="status ${r.status}">${r.status}</span></div><small>${esc(r.workflowName)} · ${new Date(r.createdAt).toLocaleString()}</small></button>`).join('') || '<div class="empty-state"><strong>No runs yet</strong>Your workflow’s next chapter starts with Run.</div>';
   const r = state.runs.find(r => r.id === selectedRun);
   if (!r) { $('#run-detail').innerHTML = ''; return; }
   const active = ['running', 'queued', 'paused'].includes(r.status);
-  $('#run-detail').innerHTML = `<div class="run-detail-card"><h2>${esc(r.workflowName)}</h2><div class="muted">${esc(r.profileName)} · <span class="status ${r.status}">${r.status}</span></div>${active ? `<div class="run-actions">${r.status !== 'queued' ? `<button class="button secondary" data-control="${r.status === 'paused' ? 'resume' : 'pause'}">${r.status === 'paused' ? '▶ Resume' : 'Ⅱ Pause'}</button>` : ''}<button class="button secondary danger" data-control="cancel">■ Cancel run</button></div>` : ''}<div class="progress-track"><div style="width:${r.totalSteps ? r.currentStep / r.totalSteps * 100 : 0}%"></div></div><div class="muted">${r.currentStep} / ${r.totalSteps} steps reached${r.finishedAt && r.startedAt ? ` · ${((new Date(r.finishedAt) - new Date(r.startedAt)) / 1000).toFixed(1)}s elapsed` : ''}</div>${r.error ? `<p class="error-block">${esc(r.error)}</p>` : ''}<div class="logs">${r.logs.map(l => `<div class="log ${l.level}"><time>${new Date(l.time).toLocaleTimeString()}</time>${esc(l.message)}</div>`).join('') || '<span class="muted">Waiting for an available browser…</span>'}</div>${r.screenshots.length ? `<div class="shots">${r.screenshots.map(s => `<a href="${esc(s.url)}" target="_blank" rel="noreferrer"><img src="${esc(s.url)}" alt="${esc(s.label)}"><small>${esc(s.label)} ↗</small></a>`).join('')}</div>` : ''}</div>`;
+  const renderProxyStatus = () => {
+    const card = $('#run-detail .run-detail-card');
+    if (!card) return;
+    const status = r.proxy?.status;
+    const label = { selecting: 'Selecting proxy…', checking: 'Checking proxy…', verified: 'Proxy verified', failed: 'Proxy check failed', canceled: 'Proxy check canceled', direct: 'Direct connection — no proxy' }[status] || 'Proxy not checked';
+    const panel = document.createElement('p');
+    panel.className = status === 'failed' ? 'error-block' : 'muted';
+    panel.dataset.proxyStatus = status || 'unknown';
+    panel.textContent = `${label}${r.proxy?.exitIP ? ` · Exit IP: ${r.proxy.exitIP}` : ''}${r.proxy?.checkedAt ? ` · Last verified: ${new Date(r.proxy.checkedAt).toLocaleTimeString()} (${r.proxy.phase})` : ''}. Checks run before and after playback.`;
+    card.prepend(panel);
+  };
+  $('#run-detail').innerHTML = `<div class="run-detail-card"><h2>${esc(r.name || r.workflowName)}</h2><div class="muted">${esc(r.workflowName)} · <span class="status ${r.status}">${r.status}</span></div>${active ? `<div class="run-actions">${r.status !== 'queued' ? `<button class="button secondary" data-control="${r.status === 'paused' ? 'resume' : 'pause'}">${r.status === 'paused' ? '▶ Resume' : 'Ⅱ Pause'}</button>` : ''}<button class="button secondary danger" data-control="cancel">■ Cancel run</button></div>` : ''}<div class="progress-track"><div style="width:${r.totalSteps ? r.currentStep / r.totalSteps * 100 : 0}%"></div></div><div class="muted">${r.currentStep} / ${r.totalSteps} steps reached${r.finishedAt && r.startedAt ? ` · ${((new Date(r.finishedAt) - new Date(r.startedAt)) / 1000).toFixed(1)}s elapsed` : ''}</div>${r.error ? `<p class="error-block">${esc(r.error)}</p>` : ''}<div class="logs">${r.logs.map(l => `<div class="log ${l.level}"><time>${new Date(l.time).toLocaleTimeString()}</time>${esc(l.message)}</div>`).join('') || '<span class="muted">Waiting for an available browser…</span>'}</div>${r.screenshots.length ? `<div class="shots">${r.screenshots.map(s => `<a href="${esc(s.url)}" target="_blank" rel="noreferrer"><img src="${esc(s.url)}" alt="${esc(s.label)}"><small>${esc(s.label)} ↗</small></a>`).join('')}</div>` : ''}</div>`;
+  renderProxyStatus();
+  if (r.browserOpen) {
+    const close = document.createElement('button'); close.className = 'button secondary'; close.dataset.control = 'close-browser'; close.textContent = 'Close browser';
+    $('#run-detail .run-detail-card').prepend(close);
+  }
+  const rename = document.createElement('button');
+  rename.className = 'button secondary'; rename.id = 'rename-run'; rename.textContent = 'Rename run…';
+  rename.onclick = () => openDialog('Rename run', field('Run name', 'name', r.name || r.workflowName, 'maxlength="100" placeholder="Leave blank to use the workflow name"'), 'Save name', async form => { await api(`/runs/${r.id}/rename`, { name: form.get('name') }); await refresh(); });
+  $('#run-detail h2').after(rename);
+  renderGeneratedValues(r, $('#run-detail .run-detail-card'), esc, revealedRuns.has(r.id));
+  $('[data-reveal-generated]')?.addEventListener('click', () => { if (revealedRuns.has(r.id)) revealedRuns.delete(r.id); else revealedRuns.add(r.id); renderRuns(); });
 }
 $('#nav').addEventListener('click', e => { const target = e.target.closest('[data-view]'); if (target) switchView(target.dataset.view); });
 $('#workflow-list').addEventListener('click', e => { const target = e.target.closest('[data-workflow]'); if (target) chooseWorkflow(target.dataset.workflow); });
@@ -222,10 +239,9 @@ $('#run-button').onclick = handle(runDialog); $('#runs-new').onclick = handle(ru
 $('#record-button').onclick = handle(async () => {
   cancelUrlCapture();
   if (dirty) await saveWorkflow();
-  if (!state.profiles.length) { editProfile(); return; }
   const browserId = $('#browser-select').value;
-  openDialog('Start browser capture', `<p class="muted">Open <strong>${esc(browsers.find(b => b.id === browserId)?.name || browserId)}</strong> at your starting URL. Click and type normally; actions and element HTML appear live in the builder. F12 is optional.</p><label class="form-field">Browser profile<select name="profileId">${state.profiles.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join('')}</select></label><p class="muted">Uses a separate browser window with this app’s saved session. Stop & save replaces this workflow’s actions. Recording follows tabs opened by the site. Embedded frames are not recorded.</p>`, 'Start capture', async form => {
-    await api('/record/start', { workflowId: current.id, profileId: form.get('profileId'), browserId }); $('#visual-tab').click(); await refresh(); toast('Capture started');
+  openDialog('Start browser capture', `<p class="muted">Open <strong>${esc(browsers.find(b => b.id === browserId)?.name || browserId)}</strong> at your starting URL. Click and type normally; actions and element HTML appear live in the builder. F12 is optional.</p><p class="muted">Uses a fresh browser window. Stop & save replaces this recording’s actions. Tabs opened by the site are captured.</p>`, 'Start capture', async form => {
+    await api('/record/start', { workflowId: current.id, browserId }); $('#visual-tab').click(); await refresh(); toast('Capture started');
   });
 });
 $('#record-save').onclick = handle(async () => {
@@ -235,12 +251,6 @@ $('#record-discard').onclick = handle(async () => { await api('/record/stop', { 
 $('#record-pause').onclick = handle(async () => { if (!state.recorder) return; await api('/record/pause', { paused: state.recorder.status !== 'paused' }); await refresh(); });
 $('#refresh-browsers').onclick = handle(async () => { await refreshBrowsers(); toast('Browser list refreshed'); });
 $('#browser-select').onchange = e => localStorage.setItem('browserauto-browser', e.target.value);
-$('#new-profile').onclick = () => editProfile();
-$('#profiles-grid').addEventListener('click', handle(async e => {
-  const edit = e.target.closest('[data-edit-profile]'); if (edit) editProfile(edit.dataset.editProfile);
-  const remove = e.target.closest('[data-delete-profile]');
-  if (remove && confirm('Delete this profile and its saved browser session?')) { await api(`/profiles/${remove.dataset.deleteProfile}`, undefined, 'DELETE'); await refresh(); renderProfiles(); }
-}));
 $('#runs-list').addEventListener('click', e => { const row = e.target.closest('[data-run]'); if (row) { selectedRun = row.dataset.run; renderRuns(); } });
 $('#run-detail').addEventListener('click', handle(async e => { const action = e.target.closest('[data-control]')?.dataset.control; if (action) { await api(`/runs/${selectedRun}/control`, { action }); await refresh(); } }));
 $('#dialog-close').onclick = $('#dialog-cancel').onclick = () => $('#dialog').close();
@@ -273,7 +283,7 @@ $('#import-file').onchange = handle(async e => {
     const imported = await api('/workflows', data); await refresh(); chooseWorkflow(imported.id); toast('Workflow imported');
   } finally { e.target.value = ''; }
 });
-$('#guide-button').onclick = () => openDialog('A little setup. A lot less repetition.', '<ol class="help-list"><li><strong>Try the example.</strong> “Welcome aboard” fills the included practice page. Select Run workflow to see it work.</li><li><strong>Create a workflow.</strong> Use the + beside Your workflows and choose a starting URL.</li><li><strong>Record your actions.</strong> Open the recorder, use its browser, and stop & save here. Review every captured step.</li><li><strong>Calibrate selectors.</strong> Select a step and test its selector while the recording browser is open.</li><li><strong>Add profiles.</strong> Store variables like name and email. Reference them with {{name}} in a step.</li><li><strong>Run and inspect.</strong> Select profiles, set concurrency, and follow the logs. Add screenshot steps to capture results.</li></ol><p class="muted">The app uses standard Playwright browsers. Saved sessions contain cookies and should be treated as private. Recording follows tabs opened by the site. Embedded frames are not recorded.</p>', '', null);
+$('#guide-button').onclick = () => openDialog('A little setup. A lot less repetition.', '<ol class="help-list"><li><strong>Try the example.</strong> “Welcome aboard” fills the included practice page. Select Run workflow to see it work.</li><li><strong>Create a workflow.</strong> Use the + beside Your workflows and choose a starting URL.</li><li><strong>Record your actions.</strong> Open the recorder, use its browser, and stop & save here. Review every captured step.</li><li><strong>Calibrate selectors.</strong> Select a step and test its selector while the recording browser is open.</li><li><strong>Generate answers.</strong> Review Variables &amp; generator for the recording. Answers are generated for each run.</li><li><strong>Run and inspect.</strong> Choose the number of runs and follow the live monitor. Add screenshot steps to capture results.</li></ol><p class="muted">The app uses standard Playwright browsers. Each run starts with a fresh session. Recording follows tabs opened by the site. Embedded frames are not recorded.</p>', '', null);
 $('#workflow-options').onclick = () => {
   if (!current) return;
   openDialog('Workflow options', `<p class="muted">${esc(current.name)}</p><button type="button" id="duplicate-workflow" class="button secondary">Duplicate workflow</button> <button type="button" id="delete-workflow" class="button secondary danger">Delete workflow</button>`, '', null);
@@ -283,9 +293,10 @@ $('#workflow-options').onclick = () => {
 window.addEventListener('beforeunload', e => { if (dirty || jsonDirty) { e.preventDefault(); e.returnValue = ''; } });
 window.browserAutoDesktop?.onCommand(command => {
   const buttons = { new: 'new-sidebar', save: 'save-button', import: 'import-button', export: 'export-button', record: 'record-button', pause: 'record-pause', stop: 'record-save', help: 'guide-button' };
-  if (['builder', 'profiles', 'runs'].includes(command)) switchView(command);
+  if (['builder', 'runs'].includes(command)) switchView(command);
   else if (buttons[command]) { const button = $(`#${buttons[command]}`); if (!button.disabled && !button.hidden && !button.closest('[hidden]')) button.click(); }
 });
+installGeneratorUI({ getWorkflow: () => current, setWorkflow: async saved => { current = saved; dirty = false; jsonDirty = false; await refresh(); renderBuilder(); }, save: async () => { if (dirty || jsonDirty) await saveWorkflow(); }, api, openDialog, esc, handle });
 await handle(async () => { await Promise.all([refresh(), refreshBrowsers()]); if (state.workflows[0]) chooseWorkflow(state.recorder?.workflowId || state.workflows[0].id); else renderBuilder(); window.browserAutoDesktop?.ready(); })();
 let polling = false;
 setInterval(async () => { if (polling) return; polling = true; try { await refresh(); $('.local-status').innerHTML = '<i></i>Local engine connected'; } catch { $('.local-status').textContent = 'Local engine disconnected'; } finally { polling = false; } }, 1500);

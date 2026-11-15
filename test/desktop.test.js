@@ -5,16 +5,27 @@ import path from 'node:path';
 import os from 'node:os';
 import electron from 'electron';
 import { _electron } from 'playwright';
+import { execFileSync } from 'node:child_process';
 
 test('desktop window starts its backend, exposes native menus, and shuts down cleanly', { timeout: 45000 }, async t => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'browserauto-desktop-'));
-  const env = { ...process.env, BROWSERAUTO_DATA_DIR: path.join(root, 'data') };
+  const env = { ...process.env, BROWSERAUTO_DATA_DIR: path.join(root, 'data'), BROWSERAUTO_MONITOR_DISABLED: process.env.BROWSERAUTO_TEST_MONITOR === '1' ? '0' : '1' };
   delete env.ELECTRON_RUN_AS_NODE;
   const desktop = await _electron.launch({ executablePath: process.env.BROWSERAUTO_EXECUTABLE || electron, args: [...(process.env.BROWSERAUTO_EXECUTABLE ? [] : ['.']), `--user-data-dir=${path.join(root, 'shell')}`], env });
   let closed = false;
   t.after(async () => { if (!closed) await desktop.close(); await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }); });
   const page = await desktop.firstWindow();
   await page.locator('.step').first().waitFor();
+  if (process.env.BROWSERAUTO_TEST_MONITOR === '1') {
+    let found = false;
+    for (let attempt = 0; attempt < 20 && !found; attempt++) {
+      const output = execFileSync('powershell.exe', ['-NoProfile', '-Command', "Get-Process -Name powershell -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowTitle -like '*BrowserAuto*Live Monitor*' } | Select-Object -ExpandProperty Id"], { encoding: 'utf8', windowsHide: true });
+      found = !!output.trim();
+      if (!found) await new Promise(resolve => setTimeout(resolve, 200));
+    }
+    assert.equal(found, true, 'A visible monitor terminal should open with the app');
+  }
+  assert.equal(await page.locator('[data-view="profiles"]').count(), 0);
   assert.equal(await page.evaluate(() => typeof window.browserAutoDesktop.onCommand), 'function');
   assert.equal(await page.evaluate(() => typeof window.require), 'undefined');
   const browserName = await page.locator('#browser-select option:checked').textContent();
@@ -32,6 +43,7 @@ test('desktop window starts its backend, exposes native menus, and shuts down cl
   await page.locator('#dialog-cancel').click();
   await page.getByRole('button', { name: 'Welcome aboard', exact: true }).click();
   await page.locator('#run-button').click();
+  await page.locator('[name="runName"]').fill('Named desktop run');
   await page.locator('#dialog-submit').click();
   await page.waitForFunction(async () => {
     const state = await (await fetch('/api/state')).json();
@@ -39,6 +51,11 @@ test('desktop window starts its backend, exposes native menus, and shuts down cl
     if (run?.status === 'failed') throw new Error(run.error);
     return run?.status === 'passed';
   });
+  await page.getByRole('heading', { name: 'Named desktop run', exact: true }).waitFor();
+  await page.locator('#rename-run').click();
+  await page.locator('[name="name"]').fill('Renamed desktop run');
+  await page.locator('#dialog-submit').click();
+  await page.getByRole('heading', { name: 'Renamed desktop run', exact: true }).waitFor();
   await page.locator('[data-view="builder"]').click();
   await mkdir('test-results', { recursive: true });
   await page.screenshot({ path: 'test-results/desktop-app.png' });

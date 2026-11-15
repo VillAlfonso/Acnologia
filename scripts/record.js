@@ -18,9 +18,8 @@ try {
   const available = await (await fetch(`${base.origin}/api/browsers`)).json();
   if (!available.find(b => b.id === values.browser)?.available) throw new Error(`${values.browser} is unavailable. Available: ${available.filter(b => b.available).map(b => b.id).join(', ')}`);
   if (state.recorder) throw new Error('A recording is already active. Stop it first.');
-  const profile = state.profiles[0] || await post('/profiles', { name: 'Capture profile', variables: {} });
   const workflow = await post('/workflows', { name: values.name, startUrl: values.url, steps: [] });
-  await post('/record/start', { workflowId: workflow.id, profileId: profile.id, browserId: values.browser });
+  await post('/record/start', { workflowId: workflow.id, browserId: values.browser });
   console.log(`Capturing ${values.browser}. Click and type in its window. Workflow: ${workflow.id}`);
   console.log('Commands: Enter / save = stop and save; pause; resume; discard.');
   let last = 0, busy = false;
