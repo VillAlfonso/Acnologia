@@ -20,6 +20,8 @@ test('real browser integration: playback, recording, controls, persistence, and 
   const dataDir = await mkdtemp(path.join(os.tmpdir(), 'browserauto-test-'));
   const baseUrl = 'http://127.0.0.1:4311';
   const { app, store, automation } = await createApp({ dataDir, baseUrl, headlessRecorder: true });
+  app.get('/tabs-fixture', (_req, res) => res.type('html').send('<a id="open-mail" href="/tabs-child" target="_blank">Open mail</a><input id="same-field"><button id="back" onclick="this.textContent=\'Back on original\'">Original tab</button>'));
+  app.get('/tabs-child', (_req, res) => res.type('html').send('<label>Email<input id="same-field" oninput="document.querySelector(\'#typed\').textContent=this.value"></label><p id="typed"></p>'));
   const server = await new Promise(resolve => { const listener = app.listen(4311, '127.0.0.1', () => resolve(listener)); });
   let browser;
   t.after(async () => { await browser?.close(); await automation.shutdown(); while (automation.active.size) await new Promise(r => setTimeout(r, 30)); await store.queue; await new Promise(r => server.close(r)); await rm(dataDir, { recursive: true, force: true }); });
@@ -72,6 +74,32 @@ test('real browser integration: playback, recording, controls, persistence, and 
     assert.equal(actions()[0].value, '{{password}}');
     assert.ok(!JSON.stringify(automation.recorderState()).includes('do-not-store-this'));
     await post('/record/stop', { save: false });
+  });
+  await t.test('recording and playback follow new tabs and returning to the original tab', async () => {
+    const recorded = await post('/workflows', { name: 'New-tab recording', startUrl: `${baseUrl}/tabs-fixture`, steps: [] });
+    await post('/record/start', { workflowId: recorded.id, profileId: profile.id });
+    const original = automation.recorder.page;
+    const popupEvent = automation.recorder.context.waitForEvent('page');
+    await original.locator('#open-mail').click();
+    const popup = await popupEvent;
+    await popup.locator('#same-field').fill('new-tab@example.test');
+    await waitUntil(() => actions().some(s => s.type === 'fill' && s.pageId === 1));
+    await original.locator('#same-field').fill('original-tab');
+    await original.locator('#back').click();
+    await waitUntil(() => actions().some(s => s.selector === '#back'));
+    assert.equal(automation.recorderState().tabCount, 2);
+    assert.equal(actions().filter(s => s.type === 'fill').length, 2, 'Identical selectors across tabs must not merge');
+    assert.equal(actions().at(-1).pageId, 0);
+    assert.equal((await post('/calibrate', { selector: '#typed', pageId: 1 })).count, 1);
+    await post('/record/stop', { save: true });
+    const saved = (await getState()).workflows.find(w => w.id === recorded.id);
+    saved.steps.push({ id: randomUUID(), type: 'assert', selector: '#typed', value: 'new-tab@example.test', pageId: 1 });
+    saved.steps.push({ id: randomUUID(), type: 'assert', selector: '#back', value: 'Back on original', pageId: 0 });
+    await post('/workflows', saved);
+    const [run] = await post('/runs', { workflowId: saved.id, profileIds: [profile.id], headless: true });
+    const result = await finished(run.id);
+    assert.equal(result.status, 'passed', result.error);
+    assert.ok(result.logs.some(l => l.message.includes('Tab 2')));
   });
   await t.test('installed browser capture supports HTML, pause/resume, and save', async () => {
     const available = await (await fetch(`${baseUrl}/api/browsers`)).json();
@@ -183,6 +211,11 @@ test('real browser integration: playback, recording, controls, persistence, and 
     await page.locator('#capture-html').waitFor();
     assert.match(await page.locator('#capture-html').textContent(), /id="full-name"/);
     assert.equal(await page.locator('[data-field="label"]').isDisabled(), true);
+    assert.equal(await page.locator('#start-url').isEnabled(), true, 'Start URL remains editable while recording');
+    await page.locator('#start-url').fill(`${baseUrl}/practice?next=kept`);
+    await new Promise(resolve => setTimeout(resolve, 1600));
+    assert.equal(await page.locator('#start-url').inputValue(), `${baseUrl}/practice?next=kept`, 'Polling must preserve typed URL');
+    assert.equal(automation.recorder.page.url(), `${baseUrl}/practice?capture=final`, 'Editing must not interrupt the recording');
     await page.screenshot({ path: 'test-results/capture-html.png' });
     await page.locator('#record-pause').click();
     await waitUntil(() => automation.recorder?.status === 'paused');
@@ -192,6 +225,12 @@ test('real browser integration: playback, recording, controls, persistence, and 
     await waitUntil(() => !automation.recorder);
     await page.locator('[data-field="label"]:enabled').waitFor();
     assert.match(await page.locator('#capture-html').textContent(), /<input/);
+    assert.equal(await page.locator('#start-url').inputValue(), `${baseUrl}/practice?next=kept`, 'Stopping must preserve the next URL');
+    await page.locator('#start-url').press('Enter');
+    await waitUntil(() => automation.recorder?.status === 'recording');
+    assert.equal(automation.recorder.page.url(), `${baseUrl}/practice?next=kept`);
+    await page.locator('#record-discard').click();
+    await waitUntil(() => !automation.recorder);
     await page.setViewportSize({ width: 390, height: 844 });
     await page.screenshot({ path: 'test-results/studio-mobile.png', fullPage: true });
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false, 'Mobile layout overflows');

@@ -65,7 +65,7 @@ export async function createApp({ dataDir = path.join(root, 'data'), baseUrl = '
   app.post('/api/record/start', async (req, res) => { const data = z.object({ workflowId: z.string().uuid(), profileId: z.string().uuid(), browserId: z.enum(browserIds).default('chromium') }).parse(req.body); profile(data.profileId); res.json(await automation.startRecording(workflow(data.workflowId), data.profileId, data.browserId)); });
   app.post('/api/record/pause', (req, res) => res.json(automation.pauseRecording(z.object({ paused: z.boolean() }).parse(req.body).paused)));
   app.post('/api/record/stop', async (req, res) => { res.json(await automation.stopRecording(z.object({ save: z.boolean() }).parse(req.body).save)); });
-  app.post('/api/calibrate', async (req, res) => { res.json(await automation.calibrate(z.object({ selector: z.string().min(1).max(2000) }).parse(req.body).selector)); });
+  app.post('/api/calibrate', async (req, res) => { const data = z.object({ selector: z.string().min(1).max(2000), pageId: z.number().int().min(0).max(100).optional() }).parse(req.body); res.json(await automation.calibrate(data.selector, data.pageId)); });
   app.post('/api/runs', async (req, res) => {
     const data = z.object({ workflowId: z.string().uuid(), profileIds: z.array(z.string().uuid()).min(1).max(10), concurrency: z.number().int().min(1).max(8).default(3), headless: z.boolean().default(true), browserId: z.enum(browserIds).default('chromium'), replayMouse: z.boolean().default(true), showCursor: z.boolean().default(true), viewportWidth: z.number().int().min(320).max(3840).default(1360), viewportHeight: z.number().int().min(240).max(2160).default(900) }).parse(req.body);
     const selected = [...new Set(data.profileIds)].map(profile);

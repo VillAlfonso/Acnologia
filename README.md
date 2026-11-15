@@ -20,7 +20,7 @@ Development requires Node.js 22.12 or newer. `npm run browsers` installs bundled
 
 1. Create a workflow using **+** beside Workflows, and enter its starting URL.
 2. Choose a browser from the **Browser** dropdown. Installed browsers are enabled; **Refresh** detects newly installed browsers.
-3. Type or paste a URL into **Start URL**. After one second without typing, a valid URL automatically opens the selected browser and starts recording with the first profile. Press Enter to start immediately. Bare domains use HTTPS. Incomplete URLs do not launch a browser. Alternatively, **Start capture** lets you choose a specific profile. The URL field is locked during capture; stop before starting another recording.
+3. Type or paste a URL into **Start URL**. After one second without typing, a valid URL automatically opens the selected browser and starts recording with the first profile. Press Enter to start immediately. Bare domains use HTTPS. Incomplete URLs do not launch a browser. Alternatively, **Start capture** lets you choose a specific profile. The URL field stays editable during capture. Edits are kept as a draft without interrupting the active browser; stop and save (or discard), then press Enter to record the new URL. You can also type a URL when there are no workflows; a new workflow is created automatically.
 4. Click buttons, enter text, and select options in that browser. Actions appear live in the app.
 5. Select an action to inspect its **selector, element HTML, tag, page URL, and capture time**. This is DOM information like the Elements panel in F12; opening DevTools is optional. Markup is shown as text, never executed in the app.
 6. Use **Pause / Resume**, then **Stop & save**. Saving replaces that workflow’s existing actions. Edit the recorded actions after stopping, then run or export them as JSON.
@@ -82,7 +82,7 @@ Data is stored locally, unencrypted. Captured HTML and screenshots can contain p
 
 ## Current scope
 
-- Recording covers the original tab’s main frame. Popups, iframes, uploads, downloads, canvas actions, and drag-and-drop are not recorded.
+- Recording follows tabs and popup windows opened by the site, including links with `target="_blank"`. Every action stores its tab number; playback waits for that tab and switches back when needed. Start at the page containing the opening link so playback can reproduce it. Manually opened tabs without a recorded opening action, iframes, uploads, downloads, canvas actions, and drag-and-drop are not supported.
 - Manual address-bar navigation must be added as a Navigate action. Site navigation caused by recorded clicks is replayed by those clicks.
 - Captures store the interacted element’s HTML (up to 12,000 characters), not the entire page, network traffic, or DevTools UI.
 - Selector calibration checks uniqueness and visibility. It does not infer a website’s login or registration procedure.
@@ -99,3 +99,4 @@ npm test
 Tests cover real browser recording/replay, installed-browser capture, captured HTML, password redaction, pause/resume, parallel profiles, session serialization, failure screenshots, run controls, persistence, responsive UI, and the real Electron application’s startup, native menu commands, and backend shutdown. Tests use temporary storage; backend integration tests use port 4311. Screenshots go to `test-results/`.
 
 The desktop renderer has Node integration disabled, context isolation enabled, and sandboxing enabled. The local API checks host, origin, and a per-process mutation token. Browser launching follows [Playwright’s BrowserType API](https://playwright.dev/docs/api/class-browsertype); desktop process separation follows [Electron’s process model](https://www.electronjs.org/docs/latest/tutorial/process-model).
+

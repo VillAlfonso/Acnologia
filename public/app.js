@@ -5,7 +5,7 @@ const icons = { navigate: '↗', click: '↖', fill: 'T', select: '≡', check: 
 const labels = { navigate: 'Navigate', click: 'Click', fill: 'Fill text', select: 'Select option', check: 'Check / uncheck', press: 'Press key', wait: 'Wait', assert: 'Assert text', screenshot: 'Screenshot', move: 'Mouse movement' };
 let state = { workflows: [], profiles: [], runs: [] }, current, selectedStep, view = 'builder', dirty = false, jsonDirty = false, selectedRun, toastTimer, dialogHandler;
 let browsers = [], captureSignature = '';
-let urlCaptureTimer, startingUrlCapture = false;
+let urlCaptureTimer, startingUrlCapture = false, urlDraft;
 function cancelUrlCapture() { clearTimeout(urlCaptureTimer); urlCaptureTimer = undefined; }
 function validStartUrl(value) {
   try {
@@ -18,14 +18,17 @@ function validStartUrl(value) {
 }
 async function startCaptureFromUrl(workflowId, typedValue) {
   cancelUrlCapture();
-  if (startingUrlCapture || state.recorder || !current || current.id !== workflowId || $('#start-url').value !== typedValue) return;
+  if (startingUrlCapture || current?.id !== workflowId || $('#start-url').value !== typedValue) return;
+  if (state.recorder) { toast('Stop & save or discard the current capture first. Your new URL will stay in the field.'); return; }
   const url = validStartUrl(typedValue); if (!url) return;
   startingUrlCapture = true; renderRecorder();
   try {
+    if (!current) current = await api('/workflows', { name: 'New recording', startUrl: url, steps: [] });
     current.startUrl = url; dirty = true;
     await saveWorkflow();
     const profile = state.profiles[0] || await api('/profiles', { name: 'Capture profile', variables: {} });
-    await api('/record/start', { workflowId, profileId: profile.id, browserId: $('#browser-select').value });
+    await api('/record/start', { workflowId: current.id, profileId: profile.id, browserId: $('#browser-select').value });
+    if (urlDraft === typedValue) urlDraft = undefined;
     $('#visual-tab').click(); await refresh(); toast('Recording started — use the opened browser');
   } catch (error) { toast(`Could not start recording: ${error.message}`, true); }
   finally { startingUrlCapture = false; renderRecorder(); }
@@ -67,12 +70,14 @@ function chooseWorkflow(id) {
   if (startingUrlCapture) return;
   cancelUrlCapture();
   if ((dirty || jsonDirty) && !confirm('Discard unsaved changes to this workflow?')) return;
+  if (current?.id !== id) urlDraft = undefined;
   current = structuredClone(state.workflows.find(w => w.id === id)); dirty = false; jsonDirty = false; selectedStep = current?.steps[0]?.id;
   $('#visual-tab').click();
   switchView('builder'); renderBuilder(); renderSidebar();
 }
 function renderBuilder() {
-  $('#workflow-name').value = current?.name || ''; $('#start-url').value = current?.startUrl || '';
+  if (urlDraft !== undefined && urlDraft !== current?.startUrl) dirty = true;
+  $('#workflow-name').value = current?.name || ''; $('#start-url').value = urlDraft ?? current?.startUrl ?? '';
   $('#open-page').href = current?.startUrl || '#';
   $('#save-status').textContent = dirty ? 'Unsaved changes' : 'All changes saved locally';
   for (const id of ['run-button', 'save-button', 'export-button', 'record-button', 'add-step']) $(`#${id}`).disabled = !current;
@@ -91,6 +96,7 @@ function renderInspector() {
   const needsValue = !['click', 'screenshot', 'move'].includes(s.type);
   const hints = { navigate: 'An http or https URL', fill: 'Text or a variable, like {{email}}', select: 'The option label or value', check: 'true to check, false to uncheck', press: 'For example: Enter, Tab, Control+A', wait: 'Duration in milliseconds (0–120000)', assert: 'Text the element must contain' };
   $('#step-inspector').innerHTML = `<h3>Action properties <span>STEP ${displayedSteps().indexOf(s) + 1}</span></h3><label class="form-field">Step name<input data-field="label" value="${esc(s.label)}" maxlength="200"></label><label class="form-field">Action<select data-field="type">${Object.entries(labels).map(([value, label]) => `<option value="${value}" ${s.type === value ? 'selected' : ''}>${label}</option>`).join('')}</select></label>${needsSelector ? `<label class="form-field">Element selector<input data-field="selector" value="${esc(s.selector)}" placeholder="#email or text=Continue"><small>CSS or a Playwright selector. Must match one element.</small></label><button id="test-selector" class="button secondary">Test selector</button><div id="calibration-result" class="calibration-result"></div>` : ''}${needsValue ? `<label class="form-field">${s.type === 'wait' ? 'Duration' : 'Value'}<textarea data-field="value" rows="2">${esc(s.value)}</textarea><small>${esc(hints[s.type])}</small></label>` : ''}<label class="form-field">Timeout (ms)<input data-field="timeout" type="number" min="100" max="120000" value="${s.timeout}"></label><div class="step-controls"><label><input data-field="enabled" type="checkbox" ${s.enabled ? 'checked' : ''}> Enabled</label><button class="icon-button" data-step-action="up" title="Move step up">↑</button><button class="icon-button" data-step-action="down" title="Move step down">↓</button><button class="icon-button danger" data-step-action="delete" title="Delete step">×</button></div><div class="capture-details"><h4>Captured element HTML</h4>${s.capture ? `<dl class="capture-meta"><dt>Element</dt><dd>&lt;${esc(s.capture.tag)}&gt;</dd><dt>Page</dt><dd>${esc(s.capture.pageUrl)}</dd><dt>Captured</dt><dd>${esc(new Date(s.capture.timestamp).toLocaleTimeString())}</dd></dl><pre id="capture-html" class="capture-html">${esc(s.capture.html)}</pre><button id="copy-html" class="button secondary">Copy HTML</button>` : '<p class="muted">No HTML captured. Record an action in the browser to inspect its element here.</p>'}</div>`;
+  $('#step-inspector').insertAdjacentHTML('beforeend', `<p class="muted">Browser tab: ${(s.pageId ?? 0) + 1}</p>`);
   if (s.mousePath?.length) {
     const last = s.mousePath.at(-1);
     $('#step-inspector').insertAdjacentHTML('beforeend', `<div class="capture-details"><h4>Recorded cursor path · ${s.mousePath.length} points</h4><svg class="cursor-map" viewBox="0 0 300 120" aria-label="Recorded cursor trail"><polyline points="${s.mousePath.map(p => `${p.x * 300},${p.y * 120}`).join(' ')}" fill="none" stroke="#0067b8" stroke-width="1.5"/><circle cx="${last.x * 300}" cy="${last.y * 120}" r="3" fill="#c22"/></svg><p class="muted">Viewport: ${last.width} × ${last.height}. Replay scales the path to the current browser size.</p></div>`);
@@ -109,9 +115,11 @@ function renderRecorder() {
   $('#record-button').disabled = !current || startingUrlCapture;
   $('#record-pause').textContent = r?.status === 'paused' ? 'Resume' : 'Pause';
   $('#record-pause').disabled = !['recording', 'paused'].includes(r?.status);
-  $('#recording-info').textContent = r ? `${r.browserId} · ${r.steps.length} actions captured${r.error ? ` · ${r.error}` : ` · ${r.url || 'Opening browser…'}`}` : startingUrlCapture ? 'Opening browser and starting recording…' : 'Enter a Start URL to begin recording automatically after 1 second. Press Enter to start immediately. Uses the first profile.';
+  $('#recording-info').textContent = r ? `${r.browserId} · ${r.tabCount || 0} tabs · ${r.steps.length} actions captured${r.error ? ` · ${r.error}` : ` · ${r.url || 'Opening browser…'}`}` : startingUrlCapture ? 'Opening browser and starting recording…' : 'Enter a Start URL to begin recording automatically after 1 second. Press Enter to start immediately. Uses the first profile.';
   $('#capture-mode').textContent = activeCapture() ? 'Live capture — stop to edit' : 'Editor';
-  for (const id of ['save-button', 'add-step', 'apply-json', 'workflow-name', 'start-url']) $(`#${id}`).disabled = !current || !!activeCapture() || startingUrlCapture;
+  for (const id of ['save-button', 'add-step', 'apply-json', 'workflow-name']) $(`#${id}`).disabled = !current || !!activeCapture() || startingUrlCapture;
+  $('#start-url').disabled = false;
+  if (urlDraft !== undefined && (r || startingUrlCapture)) $('#recording-info').textContent += ' · New URL kept as a draft; stop the current capture, then press Enter to use it.';
   $('#run-button').disabled = !current || !!activeCapture();
   $('#json-tab').disabled = !!activeCapture();
   const signature = activeCapture() ? JSON.stringify([r.status, r.steps.length, r.steps.at(-1)]) : '';
@@ -123,7 +131,7 @@ function renderRecorder() {
 }
 async function saveWorkflow() {
   if (!current) throw new Error('Create a workflow first.');
-  const value = jsonDirty ? { ...JSON.parse($('#json-editor').value), id: current.id } : current;
+  const value = jsonDirty ? { ...JSON.parse($('#json-editor').value), id: current.id } : { ...current, ...(urlDraft !== undefined ? { startUrl: validStartUrl(urlDraft) || urlDraft } : {}) };
   current = await api('/workflows', value); dirty = false; jsonDirty = false; await refresh(); renderBuilder(); return current;
 }
 function openDialog(title, body, submit, handler) {
@@ -173,11 +181,12 @@ $('#new-sidebar').onclick = newWorkflow;
 $('#workflow-name').oninput = e => { if (current) { current.name = e.target.value; markDirty(); } };
 $('#start-url').oninput = e => {
   cancelUrlCapture();
-  if (!current) return;
   const value = e.target.value;
-  current.startUrl = value; $('#open-page').href = validStartUrl(value) || '#'; markDirty();
+  urlDraft = value;
+  if (current && !state.recorder && !startingUrlCapture) current.startUrl = value;
+  $('#open-page').href = validStartUrl(value) || '#'; markDirty();
   if (validStartUrl(value) && !state.recorder) {
-    const workflowId = current.id;
+    const workflowId = current?.id;
     urlCaptureTimer = setTimeout(() => startCaptureFromUrl(workflowId, value), 1000);
   }
 };
@@ -194,7 +203,7 @@ $('#step-inspector').addEventListener('input', e => {
 $('#step-inspector').addEventListener('click', handle(async e => {
   if (e.target.id === 'copy-html') { await navigator.clipboard.writeText(displayedSteps().find(s => s.id === selectedStep).capture.html); toast('Element HTML copied'); return; }
   if (e.target.id === 'test-selector') {
-    const step = displayedSteps().find(s => s.id === selectedStep); const result = await api('/calibrate', { selector: step.selector });
+    const step = displayedSteps().find(s => s.id === selectedStep); const result = await api('/calibrate', { selector: step.selector, pageId: step.pageId ?? 0 });
     $('#calibration-result').textContent = `${result.count} match${result.count !== 1 ? 'es' : ''} · ${result.count === 1 && result.visible ? 'Ready to use' : 'Choose a unique, visible element'}`; return;
   }
   if (activeCapture()) return;
@@ -215,7 +224,7 @@ $('#record-button').onclick = handle(async () => {
   if (dirty) await saveWorkflow();
   if (!state.profiles.length) { editProfile(); return; }
   const browserId = $('#browser-select').value;
-  openDialog('Start browser capture', `<p class="muted">Open <strong>${esc(browsers.find(b => b.id === browserId)?.name || browserId)}</strong> at your starting URL. Click and type normally; actions and element HTML appear live in the builder. F12 is optional.</p><label class="form-field">Browser profile<select name="profileId">${state.profiles.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join('')}</select></label><p class="muted">Uses a separate browser window with this app’s saved session. Stop & save replaces this workflow’s actions. Recording covers the main tab and main frame.</p>`, 'Start capture', async form => {
+  openDialog('Start browser capture', `<p class="muted">Open <strong>${esc(browsers.find(b => b.id === browserId)?.name || browserId)}</strong> at your starting URL. Click and type normally; actions and element HTML appear live in the builder. F12 is optional.</p><label class="form-field">Browser profile<select name="profileId">${state.profiles.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join('')}</select></label><p class="muted">Uses a separate browser window with this app’s saved session. Stop & save replaces this workflow’s actions. Recording follows tabs opened by the site. Embedded frames are not recorded.</p>`, 'Start capture', async form => {
     await api('/record/start', { workflowId: current.id, profileId: form.get('profileId'), browserId }); $('#visual-tab').click(); await refresh(); toast('Capture started');
   });
 });
@@ -264,7 +273,7 @@ $('#import-file').onchange = handle(async e => {
     const imported = await api('/workflows', data); await refresh(); chooseWorkflow(imported.id); toast('Workflow imported');
   } finally { e.target.value = ''; }
 });
-$('#guide-button').onclick = () => openDialog('A little setup. A lot less repetition.', '<ol class="help-list"><li><strong>Try the example.</strong> “Welcome aboard” fills the included practice page. Select Run workflow to see it work.</li><li><strong>Create a workflow.</strong> Use the + beside Your workflows and choose a starting URL.</li><li><strong>Record your actions.</strong> Open the recorder, use its browser, and stop & save here. Review every captured step.</li><li><strong>Calibrate selectors.</strong> Select a step and test its selector while the recording browser is open.</li><li><strong>Add profiles.</strong> Store variables like name and email. Reference them with {{name}} in a step.</li><li><strong>Run and inspect.</strong> Select profiles, set concurrency, and follow the logs. Add screenshot steps to capture results.</li></ol><p class="muted">The app uses standard Playwright browsers. Saved sessions contain cookies and should be treated as private. Recording covers the main tab and main frame.</p>', '', null);
+$('#guide-button').onclick = () => openDialog('A little setup. A lot less repetition.', '<ol class="help-list"><li><strong>Try the example.</strong> “Welcome aboard” fills the included practice page. Select Run workflow to see it work.</li><li><strong>Create a workflow.</strong> Use the + beside Your workflows and choose a starting URL.</li><li><strong>Record your actions.</strong> Open the recorder, use its browser, and stop & save here. Review every captured step.</li><li><strong>Calibrate selectors.</strong> Select a step and test its selector while the recording browser is open.</li><li><strong>Add profiles.</strong> Store variables like name and email. Reference them with {{name}} in a step.</li><li><strong>Run and inspect.</strong> Select profiles, set concurrency, and follow the logs. Add screenshot steps to capture results.</li></ol><p class="muted">The app uses standard Playwright browsers. Saved sessions contain cookies and should be treated as private. Recording follows tabs opened by the site. Embedded frames are not recorded.</p>', '', null);
 $('#workflow-options').onclick = () => {
   if (!current) return;
   openDialog('Workflow options', `<p class="muted">${esc(current.name)}</p><button type="button" id="duplicate-workflow" class="button secondary">Duplicate workflow</button> <button type="button" id="delete-workflow" class="button secondary danger">Delete workflow</button>`, '', null);
