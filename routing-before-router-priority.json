@@ -1,0 +1,30 @@
+[
+  {
+    "InterfaceIndex": 51,
+    "InterfaceAlias": "Ethernet 5",
+    "AddressFamily": 23,
+    "InterfaceMetric": 25,
+    "AutomaticMetric": 1
+  },
+  {
+    "InterfaceIndex": 14,
+    "InterfaceAlias": "Ethernet",
+    "AddressFamily": 23,
+    "InterfaceMetric": 35,
+    "AutomaticMetric": 1
+  },
+  {
+    "InterfaceIndex": 51,
+    "InterfaceAlias": "Ethernet 5",
+    "AddressFamily": 2,
+    "InterfaceMetric": 25,
+    "AutomaticMetric": 1
+  },
+  {
+    "InterfaceIndex": 14,
+    "InterfaceAlias": "Ethernet",
+    "AddressFamily": 2,
+    "InterfaceMetric": 35,
+    "AutomaticMetric": 1
+  }
+]

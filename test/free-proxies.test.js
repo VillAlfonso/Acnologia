@@ -3,12 +3,39 @@ import assert from 'node:assert/strict';
 import { mkdtemp, rm } from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
-import { FreeProxyPool, parseProxyList, checkTarget } from '../lib/free-proxies.js';
+import { FreeProxyPool, parseProxyList, checkTarget, parseSource, proxySources } from '../lib/free-proxies.js';
 import { createServer } from 'node:http';
 import { connect } from 'node:net';
 
 test('public lists accept only public IPv4 HTTP endpoints', () => {
   assert.deepEqual(parseProxyList('http://8.8.8.8:8080\n8.8.8.8:8080\nsocks5://1.1.1.1:1080\n127.0.0.1:80\n10.1.1.1:80\n169.254.169.254:80\n192.168.1.1:80\n100.64.0.1:80\n8.8.4.4:99999\nhttp://user:pass@1.1.1.1:80'), ['http://8.8.8.8:8080']);
+});
+
+test('all six sources are registered; Geonode filters protocols and private addresses', () => {
+  assert.deepEqual(proxySources.map(source => source.name), ['IPLocate', 'ProxyScrape', 'Monosans', 'Proxifly', 'Geonode', 'MADEVAL']);
+  const source = proxySources.find(source => source.name === 'Geonode');
+  assert.deepEqual(parseSource(source, JSON.stringify({ data: [
+    { ip: '8.8.8.8', port: '8080', protocols: ['http'] },
+    { ip: '8.8.8.8', port: 8080, protocols: ['http'] },
+    { ip: '1.1.1.1', port: 1080, protocols: ['socks5'] },
+    { ip: '127.0.0.1', port: 80, protocols: ['http'] },
+  ] })), ['http://8.8.8.8:8080']);
+  assert.throws(() => parseSource(source, '{broken'));
+});
+
+test('feed loading deduplicates, reports failures and gives small lists early candidates', async t => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'browserauto-feeds-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const pool = new FreeProxyPool(root, { sources: [{ name: 'Large', url: 'large' }, { name: 'Small', url: 'small' }, { name: 'Offline', url: 'offline' }], download: async url => {
+    if (url === 'offline') throw Error('offline');
+    if (url === 'small') return '1.1.1.1:80\n8.8.8.1:80';
+    return Array.from({ length: 100 }, (_, i) => `8.8.8.${i + 1}:80`).join('\n');
+  } });
+  await pool.refresh();
+  assert.equal(pool.servers.length, 101);
+  assert.ok(pool.servers.slice(0, 4).includes('http://1.1.1.1:80'));
+  assert.deepEqual(pool.serverSources.get('http://8.8.8.1:80'), ['Large', 'Small']);
+  assert.equal(pool.sourceReports[2].status, 'unavailable');
 });
 
 test('public proxy selection skips failures, direct and reused IPs, and persists reservations', async t => {

@@ -1,0 +1,31 @@
+import assert from 'node:assert/strict';
+import http from 'node:http';
+import net from 'node:net';
+import {mkdtemp,writeFile} from 'node:fs/promises';
+import path from 'node:path';
+import os from 'node:os';
+import {cycleAirplane,createMobileRelay,openMobile} from 'file:///C:/BrowserAuto/source-switch-proxy-20261115/lib/mobile.js';
+let enabled=false,calls=[];
+const fakeExec=async (_file,args)=>{const action=args.at(-1);calls.push(action);if(action==='enable')enabled=true;if(action==='disable')enabled=false;return {stdout:enabled?'enabled':'disabled',stderr:''};};
+await cycleAirplane({serial:'phone'},{},{exec:fakeExec,wait:async()=>{}});assert.equal(enabled,false);assert.ok(calls.includes('enable')&&calls.includes('disable'));
+await assert.rejects(cycleAirplane({serial:'phone'},{},{exec:fakeExec,wait:async()=>{throw new Error('interrupted');}}),/interrupted/);assert.equal(enabled,false);
+const origin=http.createServer((req,res)=>res.end(req.socket.remoteAddress));await new Promise(r=>origin.listen(0,'127.0.0.1',r));
+const relay=await createMobileRelay('127.0.0.2');
+const request=()=>new Promise((resolve,reject)=>{http.get(relay.server,{path:`http://127.0.0.1:${origin.address().port}/`},r=>{let text='';r.on('data',c=>text+=c);r.on('end',()=>resolve({status:r.statusCode,text}));}).on('error',reject);});
+try {
+ assert.equal((await request()).text,'127.0.0.2');
+ const tunnel=await new Promise((resolve,reject)=>{const req=http.request(relay.server,{method:'CONNECT',path:`127.0.0.1:${origin.address().port}`});req.on('connect',(_res,socket)=>resolve(socket));req.on('error',reject);req.end();});
+ const reply=new Promise((resolve,reject)=>{let text='';tunnel.on('data',c=>text+=c);tunnel.on('end',()=>resolve(text));tunnel.on('error',reject);});
+ tunnel.write('GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n');assert.match(await reply,/127\.0\.0\.2/);
+ relay.block();assert.equal((await request()).status,503);relay.resume('127.0.0.2');assert.equal((await request()).status,200);
+} finally {await relay.close();origin.closeAllConnections();await new Promise(r=>origin.close(r));}
+const root=await mkdtemp(path.join(os.tmpdir(),'mobile-mode-test-'));
+await writeFile(path.join(root,'mobile.json'),JSON.stringify({serial:'phone',adapterId:'usb'}));
+let ticks=0,ipCalls=0,closed=0,blocked=false;
+const dependencies={devices:async()=>[{serial:'phone',status:'device'}],adapters:async()=>[{id:'usb',address:'127.0.0.2'}],exec:async()=>({stdout:'0'}),exitIP:async()=>++ipCalls===1?'1.1.1.1':'2.2.2.2',cycle:async()=>{},relay:async()=>({server:'http://127.0.0.1:1234',block(){blocked=true;},resume(){blocked=false;},async close(){closed++;}}),now:()=>ticks,wait:async ms=>{ticks+=ms;}};
+const session=await openMobile(root,{},dependencies);assert.equal(session.mobile.exitIP,'2.2.2.2');assert.equal(blocked,false);
+await assert.rejects(openMobile(root,{},dependencies),/already in use/);
+await assert.rejects(session.mobile.rotate(),/No new mobile IP/);assert.equal(blocked,true);
+await session.mobile.release();await session.mobile.release();assert.equal(closed,1);
+ipCalls=0;ticks=0;const next=await openMobile(root,{},dependencies);await next.mobile.release();
+console.log('PASS: airplane mode restored on success/failure; HTTP and CONNECT bind USB source; blocked relay rejects traffic; IP change required; same IP fails; exclusive lease and cleanup.');
